@@ -1,0 +1,23 @@
+# Render.com blueprint: New → Blueprint → pick this repository → Apply.
+services:
+  - type: web
+    name: infodesk-attendance
+    runtime: node
+    plan: starter            # a paid plan is required for the persistent disk below
+    region: singapore        # closest Render region to India
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.20.0
+      - key: DB_PATH
+        value: /var/data/attendance.db
+      - key: TZ_NAME
+        value: Asia/Kolkata
+      - key: ADMIN_PASSWORD
+        sync: false          # Render asks you for this when you apply the blueprint
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1

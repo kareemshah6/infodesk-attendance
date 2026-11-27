@@ -1,0 +1,20 @@
+# systemd service: keeps the app running and restarts it after reboots or crashes.
+# Install: sudo cp deploy/infodesk-attendance.service /etc/systemd/system/
+#          sudo systemctl enable --now infodesk-attendance
+[Unit]
+Description=Infodesk Attendance
+After=network.target
+
+[Service]
+Type=simple
+User=infodesk
+WorkingDirectory=/opt/infodesk-attendance
+Environment=PORT=3000
+Environment=DB_PATH=/var/lib/infodesk/attendance.db
+Environment=PUBLIC_URL=https://attendance.example.com
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

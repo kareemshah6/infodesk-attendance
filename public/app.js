@@ -42,6 +42,7 @@ const ICONS = {
   more: '<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>',
   scan: '<path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 12h10"/>',
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
 };
@@ -673,7 +674,7 @@ VIEWS.people = async (view) => {
   let users = [], batches = [];
   view.innerHTML = `
     <div class="page-head"><div><h1>People</h1><p>Staff, partners and students who can use the app.</p></div>
-      <button class="btn primary" id="addUser">${icon('plus')} Add person</button></div>
+      <div class="btn-row"><button class="btn" id="importUsers">${icon('upload')} Import from Excel</button><button class="btn primary" id="addUser">${icon('plus')} Add person</button></div></div>
     <div class="card">
       <div class="toolbar">
         <div class="tabs" id="peopleTabs">${['all', 'staff', 'partner', 'student', 'admin'].map((r) => `<button data-r="${r}">${r === 'all' ? 'All' : ROLE_PLURAL[r]}</button>`).join('')}</div>
@@ -695,6 +696,7 @@ VIEWS.people = async (view) => {
   $('#peopleTabs').onclick = (e) => { const b = e.target.closest('button'); if (b) { role = b.dataset.r; draw(); } };
   $('#peopleQ').oninput = (e) => { q = e.target.value.trim().toLowerCase(); draw(); };
   $('#addUser').onclick = () => userForm(null, batches, load, role === 'all' ? 'student' : role);
+  $('#importUsers').onclick = () => importPeople(load);
   $('#peopleBody').onclick = (e) => { const tr = e.target.closest('tr[data-id]'); if (tr) userForm(users.find((u) => u.id === Number(tr.dataset.id)), batches, load); };
   await load();
 };
@@ -739,6 +741,148 @@ function userForm(user, batches, onSaved, defaultRole = 'student') {
       } else toast('Saved', 'ok');
       onSaved();
     } catch (err) { toast(err.message, 'err'); }
+  };
+}
+
+// ---------- bulk import from Excel / CSV ----------
+const IMPORT_COLUMNS = {
+  name: ['name', 'full name', 'student name', 'staff name'],
+  username: ['username', 'user name', 'login', 'roll no', 'roll number', 'roll', 'enrollment no', 'enrolment no', 'reg no', 'registration no', 'id'],
+  phone: ['phone', 'mobile', 'mobile no', 'phone no', 'contact', 'contact no', 'whatsapp'],
+  batch: ['batch', 'batch name', 'class', 'course batch'],
+  role: ['role', 'type', 'category'],
+  join_date: ['join date', 'joining date', 'admission date', 'date of joining', 'doj', 'date of admission'],
+  password: ['password'],
+  designation: ['designation', 'post', 'position'],
+};
+function parseCsv(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  text = text.replace(/^﻿/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ',' || c === ';' || c === '\t') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+let excelPromise = null;
+const loadExcelReader = () => excelPromise || (excelPromise = new Promise((res, rej) => {
+  const s = document.createElement('script');
+  s.src = '/vendor/read-excel-file.js'; s.onload = () => res(window.readXlsxFile || window.readExcelFile); s.onerror = () => rej(new Error('Could not load the Excel reader'));
+  document.head.appendChild(s);
+}));
+async function readSheet(file) {
+  if (/\.xlsx$/i.test(file.name)) {
+    const read = await loadExcelReader();
+    let rows = await read(file);
+    // newer versions return [{ sheet, data }] (one entry per sheet); use the first sheet
+    if (rows.length && rows[0] && !Array.isArray(rows[0]) && Array.isArray(rows[0].data)) rows = rows[0].data;
+    return rows.map((r) => r.map((c) => c instanceof Date
+      ? `${c.getFullYear()}-${String(c.getMonth() + 1).padStart(2, '0')}-${String(c.getDate()).padStart(2, '0')}`
+      : c == null ? '' : String(c)));
+  }
+  if (/\.xls$/i.test(file.name)) throw new Error('Old .xls files are not supported. In Excel choose File → Save As → Excel Workbook (.xlsx) or CSV.');
+  return parseCsv(await file.text());
+}
+function rowsToPeople(rows) {
+  const firstIdx = rows.findIndex((r) => r.some((c) => String(c ?? '').trim() !== ''));
+  if (firstIdx < 0) throw new Error('The file is empty.');
+  const header = rows[firstIdx].map((h) => String(h).trim().toLowerCase().replace(/[_.*:]/g, ' ').replace(/\s+/g, ' ').trim());
+  const map = {};
+  for (const [key, names] of Object.entries(IMPORT_COLUMNS)) {
+    const idx = header.findIndex((h) => names.includes(h));
+    if (idx >= 0) map[key] = idx;
+  }
+  if (map.name == null) throw new Error('Could not find a "Name" column. Download the template to see the expected columns.');
+  const people = [];
+  rows.forEach((r, idx) => {
+    if (idx <= firstIdx || !r.some((c) => String(c ?? '').trim() !== '')) return; // skip header and blank rows
+    people.push({ row: idx + 1, ...Object.fromEntries(Object.entries(map).map(([k, i]) => [k, String(r[i] ?? '').trim()])) });
+  });
+  if (!people.length) throw new Error('No people found below the header row.');
+  return { people, columns: Object.keys(map) };
+}
+function downloadText(name, text) {
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' })), download: name });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+const csvLine = (cells) => cells.map((c) => { const v = String(c ?? ''); return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; }).join(',');
+
+function importPeople(onDone) {
+  const m = openModal('Import people from Excel', `
+    <ol style="padding-left:20px;margin-top:0">
+      <li>Download the template, or use your own sheet with a <b>Name</b> column.</li>
+      <li>Fill one person per row. Only <b>Name</b> is required.</li>
+      <li>Upload the file (.xlsx or .csv) and check the preview.</li>
+    </ol>
+    <p class="muted small">Optional columns: Username (or Roll No), Phone, Batch, Role (student / staff / partner — blank means student), Joining Date (DD/MM/YYYY), Designation, Password.
+      Missing usernames and passwords are created automatically.</p>
+    <div class="btn-row" style="margin-bottom:14px"><button class="btn sm" id="tplBtn">${icon('download')} Download template</button></div>
+    <label class="field"><span>Excel or CSV file</span><input type="file" id="impFile" accept=".xlsx,.csv,.txt,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>
+    <label class="switch"><input type="checkbox" id="impCreate" checked><span>Create batches that don't exist yet</span></label>
+    <div id="impPreview"></div>`, { wide: true, footer: `<button class="btn" data-close>Cancel</button><button class="btn primary" id="impGo" disabled>Import</button>` });
+  let people = null;
+  $('#tplBtn', m.el).onclick = () => downloadText('infodesk-import-template.csv', [
+    csvLine(['Name', 'Roll No', 'Phone', 'Batch', 'Role', 'Joining Date', 'Designation']),
+    csvLine(['Aarav Gupta', 'stu201', '9876500001', 'DCA Morning', 'student', '01/12/2026', '']),
+    csvLine(['Sana Ali', '', '9876500002', 'Tally Evening', 'student', '', '']),
+    csvLine(['Ramesh Kumar', 'ramesh', '9876500003', '', 'staff', '', 'Faculty - Tally']),
+  ].join('\r\n'));
+
+  const preview = async () => {
+    const box = $('#impPreview', m.el);
+    const go = $('#impGo', m.el);
+    go.disabled = true;
+    if (!people) return;
+    box.innerHTML = '<p class="muted">Checking…</p>';
+    try {
+      const r = await api('/users/import', { method: 'POST', body: { rows: people, dry_run: true, create_batches: $('#impCreate', m.el).checked } });
+      const bad = r.results.filter((x) => !x.ok);
+      box.innerHTML = `
+        <div class="stats" style="margin:4px 0 12px"><div class="stat present"><b>${r.valid}</b><span>Ready to import</span></div><div class="stat absent"><b>${r.invalid}</b><span>With problems</span></div>${r.new_batches.length ? `<div class="stat"><b>${r.new_batches.length}</b><span>New batches</span></div>` : ''}</div>
+        ${r.new_batches.length ? `<p class="small">New batches: ${r.new_batches.map(esc).join(', ')}</p>` : ''}
+        ${bad.length ? `<p class="small"><b>These rows will be skipped</b> — fix them in the file and upload again, or import the rest now:</p>
+          <div class="table-wrap"><table><thead><tr><th>Row</th><th>Name</th><th>Problem</th></tr></thead><tbody>${bad.map((x) => `<tr><td>${x.row}</td><td>${esc(x.name)}</td><td class="small" style="color:var(--absent)">${esc(x.error)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+        ${r.valid ? `<details style="margin-top:10px"><summary class="small">Preview first ${Math.min(10, r.valid)} people</summary><div class="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Batch</th><th>Phone</th></tr></thead><tbody>
+          ${r.results.filter((x) => x.ok).slice(0, 10).map((x) => `<tr><td>${esc(x.name)}</td><td>${esc(x.username)}</td><td>${ROLE_LABEL[x.role]}</td><td>${esc(x.batch || '')}</td><td>${esc(x.phone || '')}</td></tr>`).join('')}</tbody></table></div></details>` : ''}`;
+      go.disabled = !r.valid;
+      go.textContent = `Import ${r.valid} ${r.valid === 1 ? 'person' : 'people'}`;
+    } catch (e) { box.innerHTML = `<div class="error">${esc(e.message)}</div>`; }
+  };
+  $('#impFile', m.el).onchange = async (e) => {
+    const file = e.target.files[0];
+    people = null;
+    if (!file) return preview();
+    try {
+      const parsed = rowsToPeople(await readSheet(file));
+      people = parsed.people;
+    } catch (err) { $('#impPreview', m.el).innerHTML = `<div class="error">${esc(err.message)}</div>`; return; }
+    preview();
+  };
+  $('#impCreate', m.el).onchange = preview;
+  $('#impGo', m.el).onclick = async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api('/users/import', { method: 'POST', body: { rows: people, create_batches: $('#impCreate', m.el).checked } });
+      m.close();
+      onDone();
+      const ok = r.results.filter((x) => x.ok);
+      const creds = [csvLine(['Name', 'Role', 'Batch', 'Phone', 'Username', 'Temporary password', 'Website']),
+        ...ok.map((x) => csvLine([x.name, x.role, x.batch || '', x.phone || '', x.username, x.password, location.origin]))].join('\r\n');
+      const done = openModal('Import complete', `
+        <p style="margin-top:0"><b>${r.imported}</b> ${r.imported === 1 ? 'person was' : 'people were'} added${r.invalid ? `, ${r.invalid} skipped` : ''}.</p>
+        <p><b>Download the login list now.</b> It has everyone's username and temporary password, and this is the only time the passwords are shown.
+          Share each person's login with them; they set their own password at first login.</p>`,
+        { footer: `<button class="btn" data-close>Close</button><button class="btn primary" id="credBtn">${icon('download')} Download login list</button>` });
+      $('#credBtn', done.el).onclick = () => downloadText(`infodesk-logins-${state.today}.csv`, creds);
+    } catch (err) { toast(err.message, 'err'); e.target.disabled = false; }
   };
 }
 
@@ -887,6 +1031,11 @@ VIEWS.settings = async (view) => {
       <h2>Front-desk kiosk link</h2>
       <p class="muted small">Create a new kiosk link if the old one was shared with the wrong person. The old link will stop working.</p>
       <button class="btn danger" id="regenKiosk">Create new kiosk link</button>
+    </div>
+    <div class="card" style="max-width:640px">
+      <h2>Backup</h2>
+      <p class="muted small">Download a full copy of all attendance data. Keep it somewhere safe, such as Google Drive. Do this at least once a week.</p>
+      <button class="btn" id="backupBtn">${icon('download')} Download backup</button>
     </div>`;
   $('#setForm').onsubmit = async (e) => {
     e.preventDefault();
@@ -895,6 +1044,7 @@ VIEWS.settings = async (view) => {
     try { await api('/settings', { method: 'PUT', body: f }); await loadMe(); renderShell(); route(); toast('Settings saved', 'ok'); }
     catch (err) { toast(err.message, 'err'); }
   };
+  $('#backupBtn').onclick = () => downloadFile('/backup', 'infodesk-backup.db').then(() => toast('Backup downloaded', 'ok')).catch((e) => toast(e.message, 'err'));
   $('#regenKiosk').onclick = async () => {
     if (!(await confirmBox('Create a new kiosk link? The front-desk screen will need the new link.', 'Create'))) return;
     try { await api('/settings', { method: 'PUT', body: { regenerate_kiosk: true } }); toast('New link created — see Check-in QR page', 'ok'); }

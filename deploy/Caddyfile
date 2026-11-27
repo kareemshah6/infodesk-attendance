@@ -1,0 +1,6 @@
+# Caddy gets a free HTTPS certificate automatically.
+# Replace the domain, then: sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+attendance.example.com {
+	encode gzip
+	reverse_proxy localhost:3000
+}

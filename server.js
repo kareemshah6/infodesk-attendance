@@ -379,6 +379,108 @@ app.put('/api/users/:id', auth, allow('admin'), (req, res) => {
   res.json(db.prepare(`${userSelect} WHERE u.id = ?`).get(id));
 });
 
+// ---------- bulk import (admin) ----------
+// Body: { rows: [{ name, username?, phone?, batch?, role?, join_date?, password?, designation? }], dry_run, create_batches }
+const tempPassword = () => {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  return Array.from(crypto.randomBytes(8), (b) => chars[b % chars.length]).join('');
+};
+function normalizeDate(v) {
+  v = str(v, 20);
+  if (!v) return null;
+  if (DATE_RE.test(v)) return v;
+  const m = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(v); // DD/MM/YYYY (Indian format)
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  return 'invalid';
+}
+app.post('/api/users/import', auth, allow('admin'), (req, res) => {
+  const input = Array.isArray(req.body?.rows) ? req.body.rows : fail(400, 'No rows to import.');
+  if (input.length > 2000) fail(400, 'Import at most 2000 people at a time.');
+  const dryRun = !!req.body?.dry_run;
+  const createBatches = !!req.body?.create_batches;
+  const batchByName = new Map(db.prepare('SELECT id, name FROM batches').all().map((b) => [b.name.trim().toLowerCase(), b.id]));
+  const taken = new Set(db.prepare('SELECT lower(username) AS u FROM users').all().map((r) => r.u));
+  const newBatches = new Set();
+  const results = [];
+
+  const makeUsername = (name) => {
+    const base = name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 40) || 'user';
+    let u = base, n = 1;
+    while (taken.has(u) || u.length < 3) u = `${base}${++n}`;
+    return u;
+  };
+
+  input.forEach((raw, i) => {
+    const r = { row: Number.isInteger(raw?.row) ? raw.row : i + 2 }; // spreadsheet row number (row 1 is the header)
+    try {
+      const name = str(raw?.name, 100);
+      if (!name) throw new Error('Name is missing');
+      const ROLE_ALIASES = { teacher: 'staff', faculty: 'staff', employee: 'staff', partners: 'partner', students: 'student' };
+      let role = (str(raw?.role, 20).toLowerCase() || 'student');
+      role = ROLE_ALIASES[role] || role;
+      if (!['staff', 'partner', 'student'].includes(role)) throw new Error(`Role "${raw.role}" is not valid (use student, staff or partner)`);
+      let username = str(raw?.username, 60);
+      if (username) {
+        if (!/^[A-Za-z0-9._@-]{3,60}$/.test(username)) throw new Error('Username must be 3+ characters: letters, numbers, . _ - @');
+        if (taken.has(username.toLowerCase())) throw new Error(`Username "${username}" already exists`);
+      } else username = makeUsername(name);
+      const join_date = normalizeDate(raw?.join_date);
+      if (join_date === 'invalid') throw new Error(`Joining date "${raw.join_date}" not understood (use DD/MM/YYYY)`);
+      let batch_id = null, batchName = role === 'student' ? str(raw?.batch, 100) : '';
+      if (batchName) {
+        batch_id = batchByName.get(batchName.toLowerCase()) ?? null;
+        if (batch_id == null) {
+          if (!createBatches) throw new Error(`Batch "${batchName}" does not exist`);
+          newBatches.add(batchName);
+        }
+      }
+      const password = str(raw?.password, 60) || tempPassword();
+      if (password.length < 6) throw new Error('Password must be at least 6 characters');
+      taken.add(username.toLowerCase());
+      Object.assign(r, { ok: true, name, username, password, role, batch: batchName || null, batch_id,
+        phone: optStr(raw?.phone, 30), designation: role === 'student' ? null : optStr(raw?.designation, 80), join_date });
+    } catch (e) {
+      Object.assign(r, { ok: false, name: str(raw?.name, 100), error: e.message });
+    }
+    results.push(r);
+  });
+
+  const valid = results.filter((r) => r.ok);
+  if (!dryRun && valid.length) {
+    tx(() => {
+      const addBatch = db.prepare('INSERT INTO batches (name) VALUES (?)');
+      for (const name of newBatches) batchByName.set(name.toLowerCase(), Number(addBatch.run(name).lastInsertRowid));
+      const add = db.prepare(`INSERT INTO users (name, username, password_hash, role, phone, designation, batch_id, join_date, must_change)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`);
+      const today = now().date;
+      for (const r of valid) {
+        const batchId = r.batch ? batchByName.get(r.batch.toLowerCase()) : null;
+        add.run(r.name, r.username, bcrypt.hashSync(r.password, 8), r.role, r.phone, r.designation, batchId, r.join_date || today);
+      }
+    });
+  }
+  res.json({
+    dry_run: dryRun,
+    imported: dryRun ? 0 : valid.length,
+    valid: valid.length,
+    invalid: results.length - valid.length,
+    new_batches: [...newBatches],
+    // passwords are only revealed once, after the real import
+    results: results.map((r) => (dryRun ? { ...r, password: undefined } : r)),
+  });
+});
+
+// ---------- backup (admin) ----------
+app.get('/api/backup', auth, allow('admin'), (req, res) => {
+  const fs = require('fs');
+  const os = require('os');
+  const file = path.join(os.tmpdir(), `infodesk-backup-${Date.now()}.db`);
+  db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+  res.download(file, `infodesk-attendance-backup-${now().date}.db`, () => fs.unlink(file, () => {}));
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
 // ---------- daily register & manual marking (admin) ----------
 app.get('/api/register', auth, allow('admin'), (req, res) => {
   const date = req.query.date ? checkDate(req.query.date) : now().date;
@@ -561,6 +663,7 @@ app.put('/api/settings', auth, allow('admin'), (req, res) => {
 // ---------- static files ----------
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 app.get('/vendor/jsQR.js', (req, res) => res.sendFile(require.resolve('jsqr/dist/jsQR.js')));
+app.get('/vendor/read-excel-file.js', (req, res) => res.sendFile(path.join(path.dirname(require.resolve('read-excel-file/package.json')), 'bundle/read-excel-file.min.js')));
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders(res, file) { if (/(sw\.js|index\.html)$/.test(file)) res.setHeader('Cache-Control', 'no-cache'); },
 }));
