@@ -19,7 +19,16 @@ It runs in any web browser and can be **installed on Android and iPhone** like a
 - **Excel import** for adding all students at once, and a one-click **backup** download.
 - New users get a temporary password and must set their own at first login. Admin can reset passwords.
 
-## Run it
+## Run it on Windows (easiest)
+
+1. Install **Node.js LTS** from https://nodejs.org (then restart the computer).
+2. Download this project (green **Code** button → **Download ZIP**) and extract it.
+3. Optional: double-click **add-demo-data.bat** to load sample students and staff.
+4. Double-click **start.bat**. The browser opens http://localhost:3000. Log in with `admin / admin123`.
+
+Keep the black window open while using the app; closing it stops the app.
+
+## Run it (any computer, command line)
 
 Requires **Node.js 22.13 or newer**.
 
